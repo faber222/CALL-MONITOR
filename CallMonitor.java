@@ -33,9 +33,13 @@ public class CallMonitor extends JFrame {
     private static final Color CURSOR_CLR    = new Color(255, 70, 70, 210);
 
     // ── Dados de áudio ──────────────────────────────────────────────────────
-    // PCM 16-bit signed little-endian, mono, 44100 Hz
-    private byte[]      leftPcm;
-    private byte[]      rightPcm;
+    // PCM 16-bit signed little-endian, mono, 44100 Hz.
+    // O PCM NÃO é mantido na RAM: fica nos arquivos temporários em disco
+    // (tmpLeft/tmpRight) e é lido sob demanda por PcmSource, que mantém uma
+    // pequena janela deslizante em memória. Isso permite carregar chamadas de
+    // várias horas sem estourar o heap.
+    private PcmSource   leftSrc;
+    private PcmSource   rightSrc;
     private AudioFormat monoFmt;
     private int         sampleRate   = 44100;
     private int         totalSamples = 0;
@@ -371,13 +375,13 @@ public class CallMonitor extends JFrame {
             waveLeft.setDimmed(false);
             waveRight.setDimmed(false);
         }
-        if (leftPcm != null) startPlayback();   // retoma automaticamente
+        if (leftSrc != null) startPlayback();   // retoma automaticamente
     }
 
     private void toggleSolo() {
         soloAnalista = !soloAnalista;
         atualizarDestaqueSolo();
-        if (leftPcm != null) startPlayback();   // retoma automaticamente
+        if (leftSrc != null) startPlayback();   // retoma automaticamente
     }
 
     private void atualizarDestaqueSolo() {
@@ -422,8 +426,8 @@ public class CallMonitor extends JFrame {
         SwingWorker<Void, String> w = new SwingWorker<>() {
             @Override protected Void doInBackground() throws Exception {
                 publish("Criando arquivos temporários...");
-                tmpLeft  = File.createTempFile("cm_L_", ".wav");
-                tmpRight = File.createTempFile("cm_R_", ".wav");
+                tmpLeft  = File.createTempFile("cm_L_", ".pcm");
+                tmpRight = File.createTempFile("cm_R_", ".pcm");
                 tmpLeft.deleteOnExit();
                 tmpRight.deleteOnExit();
 
@@ -433,15 +437,16 @@ public class CallMonitor extends JFrame {
                 publish("Extraindo canal direito (analista)...");
                 ffmpeg(f, tmpRight, "pan=mono|c0=FR");
 
-                publish("Lendo amostras PCM...");
-                AudioInputStream aL = AudioSystem.getAudioInputStream(tmpLeft);
-                AudioInputStream aR = AudioSystem.getAudioInputStream(tmpRight);
-                monoFmt      = aL.getFormat();
-                sampleRate   = (int) monoFmt.getSampleRate();
-                leftPcm      = aL.readAllBytes();
-                rightPcm     = aR.readAllBytes();
-                aL.close(); aR.close();
-                totalSamples = leftPcm.length / 2;
+                publish("Abrindo fontes PCM...");
+                // O ffmpeg produz PCM cru (s16le, 44100 Hz, mono): o formato é
+                // fixo e conhecido, então não há cabeçalho para parsear e o
+                // offset em bytes é simplesmente sampleIndex*2.
+                closeSources();   // libera fontes de um carregamento anterior
+                sampleRate   = 44100;
+                monoFmt      = new AudioFormat(sampleRate, 16, 1, true, false);
+                leftSrc      = new PcmSource(tmpLeft);
+                rightSrc     = new PcmSource(tmpRight);
+                totalSamples = (int) Math.min(leftSrc.totalSamples, rightSrc.totalSamples);
                 position.set(0);
                 return null;
             }
@@ -451,8 +456,8 @@ public class CallMonitor extends JFrame {
             @Override protected void done() {
                 try {
                     get();
-                    waveLeft.setPcm(leftPcm,  sampleRate);
-                    waveRight.setPcm(rightPcm, sampleRate);
+                    waveLeft.setPcm(tmpLeft,  sampleRate);
+                    waveRight.setPcm(tmpRight, sampleRate);
                     btnPlay.setEnabled(true);
                     btnModo.setEnabled(true);
                     btnCropMode.setEnabled(true);
@@ -506,11 +511,14 @@ public class CallMonitor extends JFrame {
     }
 
     private void ffmpeg(File input, File output, String filter) throws IOException, InterruptedException {
+        // Saída em PCM cru s16le (sem cabeçalho WAV): assim o arquivo é só
+        // amostras e o offset em bytes = sampleIndex*2, sem parsear cabeçalho.
         ProcessBuilder pb = new ProcessBuilder(
             ffmpegCmd(), "-y", "-i", input.getAbsolutePath(),
             "-af", filter,
             "-ar", "44100",
             "-ac", "1",
+            "-f", "s16le",
             "-acodec", "pcm_s16le",
             output.getAbsolutePath()
         );
@@ -585,12 +593,12 @@ public class CallMonitor extends JFrame {
     }
 
     private void salvarCrop() {
-        if (leftPcm == null || rightPcm == null) return;
+        if (leftSrc == null || rightSrc == null) return;
         normalizeCrop();
         if (cropIn < 0 || cropOut < 0 || cropOut <= cropIn) return;
 
         // Limita o fim ao que existe nos dois canais
-        int maxSamples = Math.min(leftPcm.length, rightPcm.length) / 2;
+        int maxSamples = (int) Math.min(leftSrc.totalSamples, rightSrc.totalSamples);
         final int s0 = cropIn;
         final int s1 = Math.min(cropOut, maxSamples);
         if (s1 <= s0) return;
@@ -615,35 +623,28 @@ public class CallMonitor extends JFrame {
         new SwingWorker<Void, Void>() {
             @Override protected Void doInBackground() throws Exception {
                 int n = s1 - s0;
-                byte[] data;
                 AudioFormat fmt;
+                InputStream pcm;
 
+                // O PCM do recorte é lido DIRETO dos arquivos de canal em disco,
+                // em blocos (InterleavedPcmStream), sem copiar o trecho para a
+                // RAM. Assim mesmo uma seleção de horas exporta sem estourar.
                 if (sep) {
                     // Separado: mono do canal ouvido (analista = direita, cliente = esquerda)
-                    byte[] ch = analyst ? rightPcm : leftPcm;
-                    data = java.util.Arrays.copyOfRange(ch, s0 * 2, s1 * 2);
-                    fmt  = new AudioFormat(sampleRate, 16, 1, true, false);
+                    File ch = analyst ? tmpRight : tmpLeft;
+                    fmt = new AudioFormat(sampleRate, 16, 1, true, false);
+                    pcm = new InterleavedPcmStream(ch, null, s0, n);
                 } else {
                     // Junto: estéreo, esquerda = cliente, direita = analista
-                    data = new byte[n * 4];
-                    for (int i = 0; i < n; i++) {
-                        int src = (s0 + i) * 2;
-                        int o   = i * 4;
-                        data[o]     = leftPcm[src];
-                        data[o + 1] = leftPcm[src + 1];
-                        data[o + 2] = rightPcm[src];
-                        data[o + 3] = rightPcm[src + 1];
-                    }
                     fmt = new AudioFormat(sampleRate, 16, 2, true, false);
+                    pcm = new InterleavedPcmStream(tmpLeft, tmpRight, s0, n);
                 }
 
                 // WAV temporário → MP3 via ffmpeg (libmp3lame, VBR ~190 kbps).
                 // Cru: sem ganho e sem mudança de velocidade.
                 File tmpWav = File.createTempFile("cm_crop_", ".wav");
                 tmpWav.deleteOnExit();
-                try (AudioInputStream ais = new AudioInputStream(
-                        new ByteArrayInputStream(data), fmt,
-                        data.length / fmt.getFrameSize())) {
+                try (AudioInputStream ais = new AudioInputStream(pcm, fmt, n)) {
                     AudioSystem.write(ais, AudioFileFormat.Type.WAVE, tmpWav);
                 }
 
@@ -685,16 +686,21 @@ public class CallMonitor extends JFrame {
     }
 
     private void startPlayback() {
-        if (leftPcm == null) return;
+        if (leftSrc == null) return;
         haltKeepPosition();          // encerra reprodução anterior sem zerar a posição
         playing.set(true);
         btnPlay.setText("⏸  Pausar");
         btnStop.setEnabled(true);
 
+        // Referências locais das fontes para o thread de reprodução (evita corrida
+        // com um recarregamento e o overhead de reler os campos no loop interno).
+        final PcmSource srcL = leftSrc;
+        final PcmSource srcR = rightSrc;
+
         playThread = new Thread(() -> {
             try {
-                log("play: leftPcm=" + (leftPcm == null ? -1 : leftPcm.length)
-                    + " rightPcm=" + (rightPcm == null ? -1 : rightPcm.length)
+                log("play: leftSrc=" + srcL.totalSamples
+                    + " rightSrc=" + srcR.totalSamples
                     + " sampleRate=" + sampleRate + " totalSamples=" + totalSamples
                     + " pos=" + position.get());
                 AudioFormat stereoFmt = new AudioFormat(sampleRate, 16, 2, true, false);
@@ -705,11 +711,11 @@ public class CallMonitor extends JFrame {
                 line.start();
                 log("linha de audio aberta; iniciando reproducao");
 
-                // As amostras são lidas DIRETO do PCM original (leftPcm/rightPcm)
-                // dentro do loop, via sampleAt(). Antes o código convertia os dois
-                // canais inteiros para float[] e ainda criava um vetor de mistura,
-                // o que estourava a memória em arquivos longos (chamadas de ~1h).
-                final int len = Math.min(leftPcm.length, rightPcm.length) / 2;
+                // As amostras são lidas DIRETO do PCM em disco (srcL/srcR), via
+                // sampleAt(), que mantém só uma pequena janela deslizante na RAM.
+                // Antes o código carregava os dois canais inteiros em byte[], o
+                // que estourava a memória em arquivos longos (chamadas de ~1h+).
+                final int len = (int) Math.min(srcL.totalSamples, srcR.totalSamples);
 
                 if (len < 1024) {   // FRAME — áudio vazio ou não carregado
                     log("reproducao abortada: len=" + len + " (audio vazio ou curto)");
@@ -769,13 +775,13 @@ public class CallMonitor extends JFrame {
                         if (refStart + HS < len) {
                             // mistura L+R da referência, calculada uma vez por quadro
                             for (int i = 0; i < HS; i += 2)
-                                refBuf[i] = sampleAt(leftPcm, refStart + i) + sampleAt(rightPcm, refStart + i);
+                                refBuf[i] = srcL.sampleAt(refStart + i) + srcR.sampleAt(refStart + i);
                             for (int d = -SEEK; d <= SEEK; d++) {
                                 int cand = base + d;
                                 if (cand < 0 || cand + HS >= len) continue;
                                 float num = 0f, energy = 0f;
                                 for (int i = 0; i < HS; i += 2) {     // passo 2 = busca 2× mais rápida
-                                    float a = sampleAt(leftPcm, cand + i) + sampleAt(rightPcm, cand + i);
+                                    float a = srcL.sampleAt(cand + i) + srcR.sampleAt(cand + i);
                                     num    += a * refBuf[i];
                                     energy += a * a;
                                 }
@@ -794,8 +800,8 @@ public class CallMonitor extends JFrame {
                     //   nova cauda = segunda metade do quadro atual (janelado)
                     float g = gainLinear;
                     for (int i = 0; i < HS; i++) {
-                        float outL = tailL[i] + sampleAt(leftPcm,  pos + i) * window[i];
-                        float outR = tailR[i] + sampleAt(rightPcm, pos + i) * window[i];
+                        float outL = tailL[i] + srcL.sampleAt(pos + i) * window[i];
+                        float outR = tailR[i] + srcR.sampleAt(pos + i) * window[i];
 
                         short sL = floatToShort(outL * g);
                         short sR = floatToShort(outR * g);
@@ -808,8 +814,8 @@ public class CallMonitor extends JFrame {
                             writeSample(lineBuf, i*4+2, mono);
                         }
 
-                        tailL[i] = sampleAt(leftPcm,  pos + HS + i) * window[HS + i];
-                        tailR[i] = sampleAt(rightPcm, pos + HS + i) * window[HS + i];
+                        tailL[i] = srcL.sampleAt(pos + HS + i) * window[HS + i];
+                        tailR[i] = srcR.sampleAt(pos + HS + i) * window[HS + i];
                     }
                     line.write(lineBuf, 0, lineBuf.length);
 
@@ -845,16 +851,6 @@ public class CallMonitor extends JFrame {
         playThread.start();
     }
 
-    // Converte PCM 16-bit LE para float normalizado [-1.0, 1.0]
-    // Lê UMA amostra do PCM 16-bit little-endian e normaliza para -1..1.
-    // Usado pelo WSOLA para trabalhar direto sobre o PCM, sem copiar tudo
-    // para float[] (o que estourava a memória em arquivos longos).
-    private static float sampleAt(byte[] pcm, int sampleIndex) {
-        int b = sampleIndex << 1;
-        int s = (short)((pcm[b+1] << 8) | (pcm[b] & 0xFF));
-        return s / 32768f;
-    }
-
     // Janela de Hanning — suaviza bordas das janelas OLA para evitar cliques na junção
     private float[] hanningWindow(int size) {
         float[] w = new float[size];
@@ -866,13 +862,6 @@ public class CallMonitor extends JFrame {
     private short floatToShort(float f) {
         float clamped = Math.max(-1f, Math.min(1f, f));
         return (short)(clamped * 32767f);
-    }
-
-    // Lê um sample 16-bit little-endian do array PCM. Retorna 0 se fora do range.
-    private short readSample(byte[] pcm, int sampleIndex) {
-        int b = sampleIndex * 2;
-        if (b + 1 >= pcm.length) return 0;
-        return (short)((pcm[b+1] << 8) | (pcm[b] & 0xFF));
     }
 
     // Escreve um sample 16-bit little-endian no buffer de saída
@@ -944,8 +933,15 @@ public class CallMonitor extends JFrame {
 
     private void cleanup() {
         stopPlayback();
+        closeSources();   // fecha os RandomAccessFile antes de apagar (necessário no Windows)
         if (tmpLeft  != null) tmpLeft.delete();
         if (tmpRight != null) tmpRight.delete();
+    }
+
+    // Fecha as fontes PCM em disco (idempotente). Chamado ao recarregar e ao sair.
+    private void closeSources() {
+        if (leftSrc  != null) { try { leftSrc.close();  } catch (IOException ignored) {} leftSrc  = null; }
+        if (rightSrc != null) { try { rightSrc.close(); } catch (IOException ignored) {} rightSrc = null; }
     }
 
     // ── Factories ───────────────────────────────────────────────────────────
@@ -987,6 +983,151 @@ public class CallMonitor extends JFrame {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // FONTE PCM EM DISCO (acesso aleatório com janela deslizante)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Em vez de manter o áudio inteiro na RAM, lê amostras 16-bit LE sob demanda
+    // de um arquivo PCM cru (s16le mono). Uma janela contígua de poucos MB é
+    // mantida em memória e recarregada quando o índice pedido cai fora dela —
+    // como a reprodução é quase sequencial (com busca WSOLA de só ±~441
+    // amostras), os recarregamentos são raros. Uso de RAM constante, mesmo em
+    // chamadas de várias horas. Não é thread-safe: cada consumidor usa o seu.
+    static final class PcmSource implements Closeable {
+        private static final int CAPACITY = 4 << 20;   // 4 MB ≈ 2M amostras ≈ 47 s
+
+        private final RandomAccessFile raf;
+        final long  totalSamples;
+        private final byte[] window = new byte[CAPACITY];
+        private long windowStartSample = 0;
+        private int  windowValidBytes  = -1;           // -1 = janela ainda não carregada
+
+        PcmSource(File pcmFile) throws IOException {
+            this.raf = new RandomAccessFile(pcmFile, "r");
+            this.totalSamples = raf.length() / 2;
+        }
+
+        // Lê uma amostra (16-bit LE). Retorna 0 fora dos limites do arquivo.
+        short readSample(long sampleIndex) {
+            if (sampleIndex < 0 || sampleIndex >= totalSamples) return 0;
+            int off = bufferOffset(sampleIndex);
+            int lo = window[off]     & 0xFF;
+            int hi = window[off + 1];                  // byte alto (com sinal)
+            return (short)((hi << 8) | lo);
+        }
+
+        // Amostra normalizada para [-1, 1], usada pelo WSOLA.
+        float sampleAt(long sampleIndex) {
+            return readSample(sampleIndex) / 32768f;
+        }
+
+        // Garante que a amostra esteja na janela e devolve o offset do seu byte baixo.
+        private int bufferOffset(long sampleIndex) {
+            long byteIndex = sampleIndex * 2;
+            // Precisa dos 2 bytes da amostra dentro da janela carregada.
+            if (windowValidBytes < 0
+                    || byteIndex < windowStartSample * 2
+                    || byteIndex + 1 >= windowStartSample * 2 + windowValidBytes) {
+                refill(sampleIndex);
+            }
+            return (int)(byteIndex - windowStartSample * 2);
+        }
+
+        // Recarrega a janela começando um pouco antes da amostra pedida (margem
+        // para cobrir a busca WSOLA para trás sem refazer leitura logo em seguida).
+        private void refill(long sampleIndex) {
+            long margin = (CAPACITY / 2) / 8;          // ~1/8 da capacidade, em amostras
+            long start  = Math.max(0, sampleIndex - margin);
+            try {
+                raf.seek(start * 2);
+                int n = 0;
+                while (n < window.length) {
+                    int r = raf.read(window, n, window.length - n);
+                    if (r < 0) break;
+                    n += r;
+                }
+                windowStartSample = start;
+                windowValidBytes  = Math.max(n, 0);
+            } catch (IOException e) {
+                throw new RuntimeException("Falha ao ler PCM do disco", e);
+            }
+        }
+
+        @Override public void close() throws IOException { raf.close(); }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STREAM DE RECORTE (PCM intercalado lido do disco, em blocos)
+    // ═══════════════════════════════════════════════════════════════════════
+    // Produz o PCM do trecho selecionado lendo direto do(s) arquivo(s) de canal,
+    // sem copiar a seleção para a RAM. Mono: copia um canal. Estéreo: intercala
+    // L e R (LRLR). Usado como fonte de um AudioInputStream na exportação.
+    static final class InterleavedPcmStream extends InputStream {
+        private final RandomAccessFile a;              // canal esquerdo (ou único)
+        private final RandomAccessFile b;              // canal direito; null = mono
+        private final boolean stereo;
+        private long remainingSamples;
+        private final byte[] frame;                    // amostra montada (2 ou 4 bytes)
+        private int framePos;
+        private final byte[] bufA, bufB;               // buffers de bloco por canal
+        private int posA, lenA, posB, lenB;
+
+        InterleavedPcmStream(File fa, File fb, long startSample, long sampleCount) throws IOException {
+            this.stereo = (fb != null);
+            this.a = new RandomAccessFile(fa, "r");
+            this.a.seek(startSample * 2);
+            if (stereo) { this.b = new RandomAccessFile(fb, "r"); this.b.seek(startSample * 2); }
+            else        { this.b = null; }
+            this.remainingSamples = sampleCount;
+            this.frame    = new byte[stereo ? 4 : 2];
+            this.framePos = frame.length;              // vazio: força preencher no 1º read
+            this.bufA = new byte[1 << 16];
+            this.bufB = stereo ? new byte[1 << 16] : null;
+        }
+
+        private int nextByteA() throws IOException {
+            if (posA >= lenA) { lenA = a.read(bufA); posA = 0; if (lenA <= 0) return -1; }
+            return bufA[posA++] & 0xFF;
+        }
+        private int nextByteB() throws IOException {
+            if (posB >= lenB) { lenB = b.read(bufB); posB = 0; if (lenB <= 0) return -1; }
+            return bufB[posB++] & 0xFF;
+        }
+
+        private boolean fillFrame() throws IOException {
+            if (remainingSamples <= 0) return false;
+            int a0 = nextByteA(), a1 = nextByteA();
+            if (a0 < 0 || a1 < 0) { remainingSamples = 0; return false; }
+            frame[0] = (byte) a0; frame[1] = (byte) a1;
+            if (stereo) {
+                int b0 = nextByteB(), b1 = nextByteB();   // canal mais curto → silêncio
+                frame[2] = (byte)(b0 < 0 ? 0 : b0);
+                frame[3] = (byte)(b1 < 0 ? 0 : b1);
+            }
+            framePos = 0;
+            remainingSamples--;
+            return true;
+        }
+
+        @Override public int read(byte[] out, int off, int len) throws IOException {
+            int produced = 0;
+            while (produced < len) {
+                if (framePos >= frame.length && !fillFrame()) break;
+                out[off + produced++] = frame[framePos++];
+            }
+            return produced == 0 ? -1 : produced;
+        }
+
+        @Override public int read() throws IOException {
+            byte[] one = new byte[1];
+            int r = read(one, 0, 1);
+            return r < 0 ? -1 : (one[0] & 0xFF);
+        }
+
+        @Override public void close() throws IOException {
+            try { a.close(); } finally { if (b != null) b.close(); }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // PAINEL DE WAVEFORM
     // ═══════════════════════════════════════════════════════════════════════
     static class WaveformPanel extends JPanel {
@@ -1008,29 +1149,56 @@ public class CallMonitor extends JFrame {
             setCursor(Cursor.getPredefinedCursor(Cursor.CROSSHAIR_CURSOR));
         }
 
-        void setPcm(byte[] pcm, int sampleRate) {
-            new SwingWorker<float[], Void>() {
-                @Override protected float[] doInBackground() {
-                    int px    = Math.max(getWidth(), 900);
-                    int total = pcm.length / 2;
+        // Lê o PCM cru (s16le mono) do arquivo em disco em blocos sequenciais,
+        // agregando o pico por faixa de pixels. Não carrega o áudio na RAM (só o
+        // float[] de picos) e publica resultados parciais para a timeline ir
+        // aparecendo progressivamente em arquivos longos.
+        void setPcm(File pcmFile, int sampleRate) {
+            final int px = Math.max(getWidth(), 900);
+            new SwingWorker<Void, float[]>() {
+                @Override protected Void doInBackground() throws Exception {
                     float[] p = new float[px];
-                    float spp = (float) total / px;
-                    for (int x = 0; x < px; x++) {
-                        int s = (int)(x * spp), end = Math.min((int)((x+1)*spp), total);
-                        float max = 0;
-                        for (int i = s; i < end; i++) {
-                            int idx = i * 2;
-                            if (idx + 1 >= pcm.length) break;
-                            short v = (short)((pcm[idx+1] << 8) | (pcm[idx] & 0xFF));
-                            float a = Math.abs(v / 32768f);
-                            if (a > max) max = a;
+                    long total = pcmFile.length() / 2;
+                    if (total <= 0) { publish(p); return null; }
+                    double spp = (double) total / px;
+                    long publishStep = Math.max(1, total / 60);
+                    long nextPublish = publishStep;
+
+                    try (InputStream in = new BufferedInputStream(
+                            new FileInputStream(pcmFile), 1 << 16)) {
+                        byte[] buf = new byte[1 << 16];
+                        long sampleIdx = 0;
+                        int  curBucket = 0;
+                        float curMax   = 0;
+                        boolean haveLo = false;
+                        int  loByte    = 0;
+                        int  read;
+                        while ((read = in.read(buf)) > 0) {
+                            for (int i = 0; i < read; i++) {
+                                if (!haveLo) { loByte = buf[i] & 0xFF; haveLo = true; continue; }
+                                short v = (short)((buf[i] << 8) | loByte);   // buf[i] = byte alto (com sinal)
+                                haveLo = false;
+                                float a = Math.abs(v / 32768f);
+                                int bucket = (int)(sampleIdx / spp);
+                                if (bucket >= px) bucket = px - 1;
+                                if (bucket != curBucket) { p[curBucket] = curMax; curBucket = bucket; curMax = 0; }
+                                if (a > curMax) curMax = a;
+                                sampleIdx++;
+                                if (sampleIdx >= nextPublish) {
+                                    p[curBucket] = curMax;
+                                    publish(p.clone());
+                                    nextPublish += publishStep;
+                                }
+                            }
                         }
-                        p[x] = max;
+                        p[curBucket] = curMax;
                     }
-                    return p;
+                    publish(p);
+                    return null;
                 }
-                @Override protected void done() {
-                    try { peaks = get(); repaint(); } catch (Exception ignored) {}
+                @Override protected void process(java.util.List<float[]> chunks) {
+                    peaks = chunks.get(chunks.size() - 1);
+                    repaint();
                 }
             }.execute();
         }
